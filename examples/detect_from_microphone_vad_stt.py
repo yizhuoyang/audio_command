@@ -73,6 +73,9 @@ parser.add_argument("--save_path", type=str, default="captured_command.wav")
 parser.add_argument("--save_debug_raw_path", type=str, default="captured_command_raw.wav")
 parser.add_argument("--save_multichannel_path", type=str, default="captured_command_multichannel.wav")
 parser.add_argument("--save_debug_audio", action="store_true")
+parser.add_argument("--enable_visualization", action="store_true")
+parser.add_argument("--visual_refresh_seconds", type=float, default=0.08)
+parser.add_argument("--visual_wave_seconds", type=float, default=2.0)
 
 parser.add_argument("--doa_block_size", type=int, default=1024)
 parser.add_argument("--doa_n_angles", type=int, default=360)
@@ -750,6 +753,146 @@ def apply_segments_to_multichannel(audio_int16: np.ndarray, segments):
     return np.concatenate(clipped_chunks, axis=0).astype(np.int16)
 
 
+class VoiceAssistantVisualizer:
+    def __init__(self, wave_seconds: float, refresh_seconds: float, wake_trigger: float, wake_release: float):
+        import matplotlib.pyplot as plt
+
+        self.plt = plt
+        self.refresh_seconds = refresh_seconds
+        self.last_refresh_time = 0.0
+        self.wave_buffer = deque(maxlen=max(1, int(wave_seconds * RATE / CHUNK)))
+        self.wake_history = deque(maxlen=200)
+        self.latest_doa_prob = np.ones(args.doa_n_angles, dtype=np.float64) / args.doa_n_angles
+        self.latest_doa_peak = None
+        self.latest_doa_confidence = 0.0
+        self.latest_asr_text = ""
+        self.state_text = STATE_WAKEWORD
+        self.detail_lines = []
+
+        plt.ion()
+        self.fig, axes = plt.subplots(2, 2, figsize=(12, 7))
+        self.ax_wave = axes[0, 0]
+        self.ax_wake = axes[0, 1]
+        self.ax_doa = axes[1, 0]
+        self.ax_text = axes[1, 1]
+
+        wave_samples = max(1, int(wave_seconds * RATE))
+        self.wave_x = np.linspace(-wave_seconds, 0.0, wave_samples)
+        self.wave_line, = self.ax_wave.plot(self.wave_x, np.zeros(wave_samples), color="#0f766e", linewidth=1.2)
+        self.ax_wave.set_title("Recent Audio")
+        self.ax_wave.set_xlim(-wave_seconds, 0.0)
+        self.ax_wave.set_ylim(-1.0, 1.0)
+        self.ax_wave.set_xlabel("Seconds")
+        self.ax_wave.set_ylabel("Amplitude")
+        self.ax_wave.grid(alpha=0.2)
+
+        self.wake_line, = self.ax_wake.plot([], [], color="#ea580c", linewidth=1.6)
+        self.ax_wake.axhline(wake_trigger, color="#dc2626", linestyle="--", linewidth=1.0, label="trigger")
+        self.ax_wake.axhline(wake_release, color="#2563eb", linestyle="--", linewidth=1.0, label="release")
+        self.ax_wake.set_title("Wakeword Score")
+        self.ax_wake.set_xlim(0, 200)
+        self.ax_wake.set_ylim(0.0, 1.0)
+        self.ax_wake.set_xlabel("Recent frames")
+        self.ax_wake.set_ylabel("Score")
+        self.ax_wake.legend(loc="upper right")
+        self.ax_wake.grid(alpha=0.2)
+
+        doa_x = np.arange(args.doa_n_angles)
+        self.doa_line, = self.ax_doa.plot(doa_x, self.latest_doa_prob, color="#7c3aed", linewidth=1.4)
+        self.ax_doa.set_title("DOA Probability")
+        self.ax_doa.set_xlim(0, args.doa_n_angles - 1)
+        self.ax_doa.set_ylim(0.0, 1.0)
+        self.ax_doa.set_xlabel("Angle (deg)")
+        self.ax_doa.set_ylabel("Probability")
+        self.ax_doa.grid(alpha=0.2)
+
+        self.ax_text.axis("off")
+        self.text_box = self.ax_text.text(
+            0.02,
+            0.98,
+            "",
+            va="top",
+            ha="left",
+            fontsize=11,
+            family="monospace",
+        )
+
+        self.fig.tight_layout()
+
+    def push_audio(self, mono_chunk: np.ndarray):
+        self.wave_buffer.append(mono_chunk.astype(np.float32) / 32768.0)
+
+    def push_wake_score(self, score: float):
+        self.wake_history.append(float(score))
+
+    def set_state(self, state_text: str, detail_lines=None):
+        self.state_text = state_text
+        self.detail_lines = detail_lines or []
+
+    def set_doa_result(self, doa_result):
+        if doa_result is None:
+            return
+        self.latest_doa_prob = doa_result["prob"]
+        self.latest_doa_peak = doa_result["peak_calib"]
+        self.latest_doa_confidence = doa_result["peak_confidence"]
+
+    def set_asr_text(self, text: str):
+        self.latest_asr_text = text or ""
+
+    def refresh(self, force: bool = False):
+        now = time.time()
+        if (not force) and (now - self.last_refresh_time < self.refresh_seconds):
+            return
+        self.last_refresh_time = now
+
+        if self.wave_buffer:
+            wave = np.concatenate(list(self.wave_buffer), axis=0)
+        else:
+            wave = np.zeros_like(self.wave_x)
+        if wave.size < self.wave_x.size:
+            wave = np.pad(wave, (self.wave_x.size - wave.size, 0))
+        else:
+            wave = wave[-self.wave_x.size:]
+        self.wave_line.set_ydata(wave)
+
+        scores = list(self.wake_history)
+        if scores:
+            x = np.arange(len(scores))
+            self.wake_line.set_data(x, scores)
+            self.ax_wake.set_xlim(0, max(200, len(scores)))
+        else:
+            self.wake_line.set_data([], [])
+            self.ax_wake.set_xlim(0, 200)
+
+        self.doa_line.set_ydata(self.latest_doa_prob)
+        doa_title = "DOA Probability"
+        if self.latest_doa_peak is not None:
+            doa_title += f" | peak={self.latest_doa_peak} deg | conf={self.latest_doa_confidence:.3f}"
+        self.ax_doa.set_title(doa_title)
+        peak_val = float(np.max(self.latest_doa_prob)) if self.latest_doa_prob.size else 1.0
+        self.ax_doa.set_ylim(0.0, max(0.15, min(1.0, peak_val * 1.15)))
+
+        text_lines = [f"State: {self.state_text}"]
+        text_lines.extend(self.detail_lines[:6])
+        if self.latest_asr_text:
+            text_lines.append("")
+            text_lines.append(f"ASR: {self.latest_asr_text[:180]}")
+        self.text_box.set_text("\n".join(text_lines))
+
+        self.fig.canvas.draw()
+        self.fig.canvas.flush_events()
+
+
+visualizer = None
+if args.enable_visualization:
+    visualizer = VoiceAssistantVisualizer(
+        wave_seconds=args.visual_wave_seconds,
+        refresh_seconds=args.visual_refresh_seconds,
+        wake_trigger=WAKE_TRIGGER_THRESHOLD,
+        wake_release=WAKE_RELEASE_THRESHOLD,
+    )
+
+
 def chunk_has_energy(audio_chunk_int16: np.ndarray) -> bool:
     if audio_chunk_int16.size == 0:
         return False
@@ -842,6 +985,17 @@ def finalize_command_and_return_to_wakeword():
         print("[INFO] Offline VAD found no extra trim points, using raw capture.")
     print("=" * 100)
 
+    if visualizer is not None:
+        visualizer.set_state(
+            "FINALIZING",
+            [
+                f"raw_len={raw_speech_len_sec:.2f}s",
+                f"refined_len={speech_len_sec:.2f}s",
+                f"doa_len={doa_len_sec:.2f}s",
+                f"segments={len(refined_segments)}",
+            ],
+        )
+
     if speech_len_sec >= MIN_VALID_SPEECH_SECONDS:
         if args.save_debug_audio:
             save_wav(args.save_debug_raw_path, command_audio, RATE)
@@ -861,6 +1015,8 @@ def finalize_command_and_return_to_wakeword():
                 f"confidence={doa_result['peak_confidence']:.3f}, "
                 f"blocks={doa_result['num_blocks']})"
             )
+            if visualizer is not None:
+                visualizer.set_doa_result(doa_result)
         else:
             print("[DOA] No usable multi-channel blocks were found for angle estimation.")
 
@@ -869,6 +1025,8 @@ def finalize_command_and_return_to_wakeword():
                 text = transcribe_audio_with_dashscope(processed_audio, RATE)
                 if text:
                     print(f"[ASR] final text: {text}")
+                    if visualizer is not None:
+                        visualizer.set_asr_text(text)
                 else:
                     print("[ASR] empty transcription.")
             except Exception as e:
@@ -885,6 +1043,9 @@ def finalize_command_and_return_to_wakeword():
     wake_release_frame_count = 0
     wake_cooldown_until = time.time() + WAKE_REARM_COOLDOWN_SECONDS
     state = STATE_WAKEWORD
+    if visualizer is not None:
+        visualizer.set_state("WAKEWORD", ["ready_for_next_trigger=True"])
+        visualizer.refresh(force=True)
     print("[INFO] Returning to WAKEWORD stage...\n")
 
 
@@ -901,6 +1062,8 @@ if __name__ == "__main__":
             raw_bytes = mic_stream.read(CHUNK, exception_on_overflow=False)
             audio_chunk = np.frombuffer(raw_bytes, dtype=np.int16)
             mono_chunk, raw4_chunk, _ = split_interleaved_chunk(audio_chunk)
+            if visualizer is not None:
+                visualizer.push_audio(mono_chunk)
 
             if state == STATE_WAKEWORD:
                 now = time.time()
@@ -910,6 +1073,7 @@ Model Name         | Score   | Wakeword Status
 ---------------------------------------------
 """
                 triggered = False
+                max_curr_score = 0.0
 
                 if wakeword_enabled:
                     _ = owwModel.predict(mono_chunk)
@@ -917,6 +1081,7 @@ Model Name         | Score   | Wakeword Status
                     for mdl in owwModel.prediction_buffer.keys():
                         scores = list(owwModel.prediction_buffer[mdl])
                         curr_score = scores[-1]
+                        max_curr_score = max(max_curr_score, curr_score)
                         in_cooldown = now < wake_cooldown_until
 
                         if curr_score < WAKE_RELEASE_THRESHOLD:
@@ -954,12 +1119,28 @@ Model Name         | Score   | Wakeword Status
                             f"{0.0:.4f} | Disabled\n"
                         )
 
+                if visualizer is not None:
+                    visualizer.push_wake_score(max_curr_score)
+                    visualizer.set_state(
+                        "WAKEWORD",
+                        [
+                            f"wake_enabled={wakeword_enabled}",
+                            f"wake_armed={wake_armed}",
+                            f"cooldown_active={now < wake_cooldown_until}",
+                            f"score={max_curr_score:.4f}",
+                        ],
+                    )
+                    visualizer.refresh()
+
                 print("\r" + output_string, end="")
                 if triggered:
                     enter_tts_reply_stage()
                 continue
 
             elif state == STATE_TTS_REPLY:
+                if visualizer is not None:
+                    visualizer.set_state("TTS_REPLY", ["speaking_reply=True"])
+                    visualizer.refresh()
                 continue
 
             elif state == STATE_COMMAND:
@@ -1044,6 +1225,20 @@ Model Name         | Score   | Wakeword Status
                     and silence_seconds >= FAST_END_SILENCE_SECONDS
                 )
 
+                if visualizer is not None:
+                    visualizer.set_state(
+                        "COMMAND_CAPTURE",
+                        [
+                            f"speech_started={speech_started}",
+                            f"speech_chunks={speech_chunk_count}",
+                            f"silent_chunks={silent_chunk_count}",
+                            f"elapsed={elapsed:.2f}s",
+                            f"speech_since_start={speech_since_start:.2f}s",
+                            f"fast_end_ready={fast_end_ready}",
+                        ],
+                    )
+                    visualizer.refresh()
+
                 if speech_started and last_voice_activity_time is not None:
                     if elapsed < COMMAND_START_GRACE_SECONDS:
                         should_stop = False
@@ -1090,6 +1285,13 @@ Model Name         | Score   | Wakeword Status
         try:
             mic_stream.stop_stream()
             mic_stream.close()
+        except Exception:
+            pass
+
+        try:
+            if visualizer is not None:
+                visualizer.refresh(force=True)
+                visualizer.plt.close(visualizer.fig)
         except Exception:
             pass
 
